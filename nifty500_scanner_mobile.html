@@ -98,6 +98,15 @@ async function prices(tk,start,end){
  const r=await fetch(DATA_API+"?tickers="+encodeURIComponent(tk.join(","))+"&start_date="+start+"&end_date="+end,{cache:"no-store"});
  if(!r.ok)throw Error("Price service HTTP "+r.status);return r.json();
 }
+// One bad ticker makes the service return HTTP 400 for the whole batch, so split and retry
+async function pricesSafe(list,s,e){
+ try{const r=await prices(list,s,e);return r.data||r}
+ catch(err){
+  if(list.length<=1||stop)return{};
+  const h=Math.ceil(list.length/2);
+  return Object.assign({},await pricesSafe(list.slice(0,h),s,e),await pricesSafe(list.slice(h),s,e));
+ }
+}
 function extract(raw,t){
  const o=raw&&raw.data?raw.data:raw,out=[];
  if(o&&typeof o==="object"&&!Array.isArray(o))for(const[d,v]of Object.entries(o)){
@@ -165,10 +174,12 @@ async function scan(){
   setSt("Loading NIFTY 500 list…");const u=await universe();
   const end=new Date(),start=new Date(end);start.setFullYear(start.getFullYear()-(wk?4:2));
   const s=start.toISOString().slice(0,10),e=end.toISOString().slice(0,10),tk=u.list.map(x=>x.symbol+".NS");
-  let raw={data:{}};const size=75;
+  setSt("Checking price service…");
+  try{await prices(["RELIANCE.NS"],s,e)}catch(x){throw Error("Price service is not responding ("+x.message+"). Try again in a few minutes")}
+  let raw={data:{}};const size=50;
   for(let i=0;i<tk.length&&!stop;i+=size){
    setSt(`Downloading prices ${Math.min(i+size,tk.length)}/${tk.length}…`);prog(i/tk.length*.8);
-   const part=await prices(tk.slice(i,i+size),s,e);Object.assign(raw.data,part.data||part);
+   Object.assign(raw.data,await pricesSafe(tk.slice(i,i+size),s,e));
   }
   if(stop){setSt("Stopped.");return}
   setSt("Loading benchmark…");
