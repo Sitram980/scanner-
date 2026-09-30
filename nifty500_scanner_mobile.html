@@ -100,21 +100,37 @@ async function prices(tk,start,end){
 }
 // One bad ticker makes the service return HTTP 400 for the whole batch, so split and retry
 async function pricesSafe(list,s,e){
- try{const r=await prices(list,s,e);return r.data||r}
+ try{return normalize(await prices(list,s,e),list)}
  catch(err){
   if(list.length<=1||stop)return{};
   const h=Math.ceil(list.length/2);
   return Object.assign({},await pricesSafe(list.slice(0,h),s,e),await pricesSafe(list.slice(h),s,e));
  }
 }
-function extract(raw,t){
- const o=raw&&raw.data?raw.data:raw,out=[];
- if(o&&typeof o==="object"&&!Array.isArray(o))for(const[d,v]of Object.entries(o)){
-  if(!v||typeof v!=="object")continue;const x=v[t]??v;
-  if(x&&typeof x==="object"&&Number.isFinite(+x.close))out.push({date:d.slice(0,10),high:+x.high,low:+x.low,close:+x.close,volume:+(x.volume||0)});
+let lastSample="";
+const isDate=k=>/^\d{4}-\d{2}-\d{2}/.test(k)||/^\d{10,13}$/.test(k);
+const dk=k=>/^\d{10,13}$/.test(String(k))?new Date(String(k).length>10?+k:+k*1000).toISOString().slice(0,10):String(k).slice(0,10);
+const gv=(o,k)=>+(o[k]??o[k[0].toUpperCase()+k.slice(1)]);
+function bar(d,o){const c=gv(o,"close");if(!Number.isFinite(c))return null;const h=gv(o,"high"),l=gv(o,"low");return{date:dk(d),high:Number.isFinite(h)?h:c,low:Number.isFinite(l)?l:c,close:c,volume:+(gv(o,"volume")||0)}}
+// Accepts several response layouts: date>ticker>OHLC, ticker>date>OHLC, ticker>[rows], or a flat list of rows
+function normalize(resp,req){
+ lastSample=JSON.stringify(resp).slice(0,180);
+ const out={},add=(t,b)=>{if(b)(out[t]??=[]).push(b)};
+ const obj=resp&&resp.data!==undefined?resp.data:resp;
+ if(Array.isArray(obj)){for(const r of obj){if(!r||typeof r!=="object")continue;const t=r.ticker??r.symbol??r.Ticker??r.Symbol??(req.length===1?req[0]:null),d=r.date??r.Date??r.datetime??r.timestamp;if(t&&d!=null)add(t,bar(d,r))}return out}
+ if(!obj||typeof obj!=="object")return out;
+ for(const[k1,v1]of Object.entries(obj)){
+  if(Array.isArray(v1)){for(const r of v1)if(r&&typeof r==="object"){const d=r.date??r.Date??r.datetime;if(d!=null)add(k1,bar(d,r))}continue}
+  if(!v1||typeof v1!=="object")continue;
+  if(Number.isFinite(gv(v1,"close"))){if(req.length===1)add(req[0],bar(k1,v1));continue}
+  for(const[k2,v2]of Object.entries(v1)){
+   if(!v2||typeof v2!=="object"||!Number.isFinite(gv(v2,"close")))continue;
+   const df=isDate(k1);add(df?k2:k1,bar(df?k1:k2,v2));
+  }
  }
- return out.sort((a,b)=>a.date.localeCompare(b.date));
+ return out;
 }
+function extract(raw,t){return(raw[t]||[]).slice().sort((a,b)=>a.date.localeCompare(b.date))}
 function weekly(a){
  const m=new Map();
  for(const b of a){const d=new Date(b.date+"T00:00:00Z");d.setUTCDate(d.getUTCDate()-((d.getUTCDay()+6)%7));const k=d.toISOString().slice(0,10);
@@ -175,15 +191,16 @@ async function scan(){
   const end=new Date(),start=new Date(end);start.setFullYear(start.getFullYear()-(wk?4:2));
   const s=start.toISOString().slice(0,10),e=end.toISOString().slice(0,10),tk=u.list.map(x=>x.symbol+".NS");
   setSt("Checking price service…");
-  try{await prices(["RELIANCE.NS"],s,e)}catch(x){throw Error("Price service is not responding ("+x.message+"). Try again in a few minutes")}
-  let raw={data:{}};const size=50;
+  let probe;try{probe=normalize(await prices(["RELIANCE.NS"],s,e),["RELIANCE.NS"])}catch(x){throw Error("Price service is not responding ("+x.message+"). Try again in a few minutes")}
+  if(!(probe["RELIANCE.NS"]||[]).length)throw Error("Price service sent data in an unexpected format: "+lastSample)
+  let raw={};const size=50;
   for(let i=0;i<tk.length&&!stop;i+=size){
    setSt(`Downloading prices ${Math.min(i+size,tk.length)}/${tk.length}…`);prog(i/tk.length*.8);
-   Object.assign(raw.data,await pricesSafe(tk.slice(i,i+size),s,e));
+   Object.assign(raw,await pricesSafe(tk.slice(i,i+size),s,e));
   }
   if(stop){setSt("Stopped.");return}
   setSt("Loading benchmark…");
-  let ba=[];try{ba=extract(await prices(["^CRSLDX"],s,e),"^CRSLDX");if(wk)ba=weekly(ba)}catch(x){}
+  let ba=[];try{ba=extract(normalize(await prices(["^CRSLDX"],s,e),["^CRSLDX"]),"^CRSLDX");if(wk)ba=weekly(ba)}catch(x){}
   const bench=ba.length>=21?100*(ba.at(-1).close/ba.at(-21).close-1):0;
   setSt("Calculating signals…");prog(.9);
   for(const m of u.list){
@@ -194,7 +211,7 @@ async function scan(){
   const sr=[...rows].sort((a,b)=>b.rs-a.rs);rows.forEach(x=>x.rank=sr.indexOf(x)+1);
   render();renderSectors();await inst();prog(1);
   setSt(`Done: ${rows.length} stocks.`+(u.full?"":" (Used built-in large-cap list — full NIFTY 500 list couldn't be downloaded.)"));
-  if(!rows.length)setSt("No price data came back. The data service may be down or blocked — try again later.",true);
+  if(!rows.length)setSt("No price data came back. Response sample: "+lastSample,true);
  }catch(e){setSt("Error: "+e.message+" — check your internet connection and try again.",true)}
  finally{$("run").disabled=false}
 }
